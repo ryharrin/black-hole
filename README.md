@@ -26,8 +26,9 @@ npm run verify     # headless Playwright checks against dist/ (run `npm run buil
 
 | Input | Action |
 | --- | --- |
-| Drag | Orbit |
-| Wheel | Zoom |
+| Drag | Rotate freely: the view tumbles past the poles, so you can go over the top and see the disk from below |
+| Wheel / pinch | Zoom |
+| Two-finger twist (touch) | Roll the view |
 | Click canvas (no drag) | Release a probe at rest under the cursor; it falls straight in |
 | `P` | Drop a probe from the default spot on the camera side |
 | `1` / `2` | Add a star / a planet on an orbit at the **orbit radius** |

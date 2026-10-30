@@ -5,7 +5,12 @@ import { CameraRig } from '../src/camera/rig.js';
 import { cinematicPose, nearestCinematicPhase, EINSTEIN_TIME } from '../src/camera/cinematic.js';
 
 const target = { addEventListener() {}, removeEventListener() {} };
-const dom = { ...target, style: {}, setPointerCapture() {}, releasePointerCapture() {}, ownerDocument: { ...target } };
+const dom = {
+  ...target, style: {}, setPointerCapture() {}, releasePointerCapture() {},
+  getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 600 }),
+  ownerDocument: { ...target, documentElement: { clientLeft: 0, clientTop: 0 } },
+};
+globalThis.window ??= { ...target, pageXOffset: 0, pageYOffset: 0 }; // TrackballControls listens for keys on window
 
 const unit = (p) => {
   const inc = (p.inclinationDeg * Math.PI) / 180;
@@ -77,4 +82,30 @@ test('exit leaves the camera where it is and re-enables controls', () => {
   assert.ok(stepDeg(before, after) < 1e-3);
   assert.ok(Math.abs(before.distance - after.distance) < 1e-6);
   assert.equal(rig.controls.enabled, true);
+});
+
+test('entering cinematic from a rolled, upside-down view eases the roll back to upright', () => {
+  const rig = makeRig({ distance: 20, inclinationDeg: 60, azimuthDeg: 30 });
+  const cam = rig.camera;
+  const viewAxis = cam.position.clone().normalize();
+  cam.up.applyAxisAngle(viewAxis, (170 * Math.PI) / 180); // free rotation left the camera nearly upside down
+  cam.lookAt(0, 0, 0);
+  cam.updateMatrixWorld();
+  const before = cam.quaternion.clone();
+  rig.setCinematic(true);
+  rig.update(1 / 60, 1);
+  assert.ok(before.angleTo(cam.quaternion) < (1 * Math.PI) / 180, 'no snap to upright on entry');
+  let prev = cam.quaternion.clone();
+  let maxTurn = 0;
+  for (let i = 0; i < 60 * 6; i++) {
+    rig.update(1 / 60, 1);
+    maxTurn = Math.max(maxTurn, prev.angleTo(cam.quaternion));
+    prev = cam.quaternion.clone();
+  }
+  assert.ok(maxTurn < (2 * Math.PI) / 180, `max per-frame turn ${(maxTurn * 180) / Math.PI} deg`);
+  // After the blend the camera's up vector lies in the plane of +y and the view axis (no roll).
+  const forward = cam.getWorldDirection(cam.position.clone());
+  const screenUp = cam.up.clone().projectOnPlane(forward).normalize();
+  const worldUp = cam.up.clone().set(0, 1, 0).projectOnPlane(forward).normalize();
+  assert.ok(screenUp.dot(worldUp) > 0.9999, `residual roll cos ${screenUp.dot(worldUp)}`);
 });

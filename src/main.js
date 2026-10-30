@@ -49,6 +49,7 @@ function resize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   post.resize(window.innerWidth, window.innerHeight, quality.renderScale);
+  rig.resize();
 }
 function set(partial) {
   if (!partial || typeof partial !== 'object' || Array.isArray(partial)) throw new TypeError('Settings must be an object.');

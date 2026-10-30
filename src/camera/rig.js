@@ -1,11 +1,13 @@
-import { Vector3 } from 'three';
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { Matrix4, Quaternion, Vector3 } from 'three';
+import { TrackballControls } from 'three/examples/jsm/controls/TrackballControls.js';
 import { cinematicPose, nearestCinematicPhase } from './cinematic.js';
 
 const DEG = Math.PI / 180;
 const MIN_DISTANCE_RS = 1.05; // closest approach, in Schwarzschild radii
 const MAX_DISTANCE_M = 80; // farthest zoom, in M
-const POLAR_EPS = 0.01; // rad; same pole margin the OrbitControls polar limits use
+const POLAR_EPS = 0.01; // rad; scripted/explicit placements keep this far from the poles, where "upright" is undefined
+const ROTATE_SPEED = 4; // TrackballControls: rad per half-screen-width of drag
+const ZOOM_SPEED = 2; // with TrackballControls' 0.00025 per wheel pixel: 5% per 100 px notch
 const FLY_RATE = 0.6; // 1/s: fly speed = FLY_RATE * (distance - rs), so approach to the horizon slows exponentially
 const FLY_FLOOR_RS = 0.15; // minimum (distance - rs) used for speed, in rs, so flying out from 1.05 rs still gets going
 const FLY_TAU = 0.35; // s, easing time constant of the fly velocity (ease in / ease out)
@@ -19,24 +21,34 @@ const smoothstep = (x) => {
   return c * c * c * (c * (c * 6 - 15) + 10); // smootherstep
 };
 const wrapDeg = (d) => ((((d + 180) % 360) + 360) % 360) - 180;
+const ORIGIN = new Vector3();
+const WORLD_UP = new Vector3(0, 1, 0);
+const _m = new Matrix4();
+const _q = new Quaternion();
 
 /**
- * Camera rig: OrbitControls (drag orbit, wheel zoom, damping, no pan) + eased fly-in/out along the view
- * radius + a scripted cinematic mode. The camera always looks at the origin (the hole).
+ * Camera rig: TrackballControls (free tumble over the poles, wheel / pinch zoom, two-finger
+ * twist roll, no pan) + eased fly-in/out along the view radius + a scripted cinematic mode. The camera
+ * always looks at the origin (the hole).
  *
  * Spherical convention (matches the v1 applyCamera): position =
  *   d * (sin(inc) * sin(az), cos(inc), sin(inc) * cos(az)); inc from +y pole, az 0 = +z toward +x.
+ * The pose does not carry roll: explicit placements are upright (+y up), and entering cinematic eases
+ * any roll from free rotation back to upright over the blend.
  */
 export class CameraRig {
   constructor(camera, domElement) {
     this.camera = camera;
-    this.controls = new OrbitControls(camera, domElement);
+    this.controls = new TrackballControls(camera, domElement);
     const controls = this.controls;
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.12;
-    controls.enablePan = false;
-    controls.minPolarAngle = POLAR_EPS;
-    controls.maxPolarAngle = Math.PI - POLAR_EPS;
+    controls.rotateSpeed = ROTATE_SPEED;
+    controls.zoomSpeed = ZOOM_SPEED;
+    // Static: the view follows the pointer exactly. Trackball inertia keeps coasting while the pointer is held
+    // still and multiplies each move, so drags and wheel notches overshoot.
+    controls.staticMoving = true;
+    controls.noPan = true;
+    controls.multiTouchRoll = true;
+    controls.keys = []; // no A/S/D drag-mode keys: the keyboard belongs to the simulation shortcuts
     controls.target.set(0, 0, 0);
     this._mass = 1;
     this._applyLimits(1);
@@ -46,6 +58,7 @@ export class CameraRig {
     this.cinematicTime = 0;
     this._blendElapsed = 0;
     this._blendFrom = null;
+    this._blendFromRoll = 0;
     this._prevDistance = null; // null => skip radial velocity measurement this frame
     this._radialVel = 0;
     this._v = new Vector3();
@@ -64,9 +77,9 @@ export class CameraRig {
     return { distance, inclinationDeg, azimuthDeg };
   }
 
-  /** Place the camera at `pose` (partial poses merge into the current one) and sync OrbitControls. */
+  /** Place the camera upright at `pose` (partial poses merge into the current one). */
   setPose(pose) {
-    if (!this._cinematic) this._flushControls(); // drop drag inertia before an explicit placement
+    if (!this._cinematic) this._flushControls(); // apply a pending drag before the explicit placement
     const cur = this.getPose();
     const distance = pose.distance ?? cur.distance;
     const inclinationDeg = pose.inclinationDeg ?? cur.inclinationDeg;
@@ -90,13 +103,14 @@ export class CameraRig {
     this._radialVel = 0;
     this._prevDistance = null;
     if (on) {
-      this._flushControls(); // drop drag inertia so the blend starts from where the camera visibly is
+      this._flushControls(); // apply a pending drag so the blend starts from where the camera visibly is
       this.controls.enabled = false;
       this._blendFrom = this.getPose();
+      this._blendFromRoll = this._roll();
       this.cinematicTime = nearestCinematicPhase(this._blendFrom, this._mass); // join the path near the current view
       this._blendElapsed = 0;
     } else {
-      // Leave the camera exactly where it is; just hand control back to OrbitControls.
+      // Leave the camera exactly where it is; just hand control back to TrackballControls.
       this._flushControls();
       this.controls.enabled = true;
     }
@@ -127,7 +141,7 @@ export class CameraRig {
         inc = from.inclinationDeg + (inc - from.inclinationDeg) * w;
         az = from.azimuthDeg + wrapDeg(az - from.azimuthDeg) * w;
       }
-      this._place(distance, inc, az);
+      this._place(distance, inc, az, w < 1 ? this._blendFromRoll * (1 - w) : 0);
     } else {
       if (dt > 0) this._fly(dt, rs, mass);
       this.controls.update();
@@ -142,6 +156,11 @@ export class CameraRig {
     this._prevDistance = distance;
     const vRef = FLY_RATE * BETA_REF_M * mass;
     return { distance, radialBeta: BETA_MAX * Math.tanh(this._radialVel / vRef) };
+  }
+
+  /** Call when the canvas is resized: TrackballControls maps drags against the element's box. */
+  resize() {
+    this.controls.handleResize();
   }
 
   dispose() {
@@ -185,25 +204,36 @@ export class CameraRig {
     this.controls.maxDistance = MAX_DISTANCE_M * mass;
   }
 
-  _place(distance, inclinationDeg, azimuthDeg) {
+  /** Upright placement (+y up), then `roll` rad about the view axis (positive = counter-clockwise on screen). */
+  _place(distance, inclinationDeg, azimuthDeg, roll = 0) {
     const mass = this._mass;
     const d = Math.min(MAX_DISTANCE_M * mass, Math.max(MIN_DISTANCE_RS * 2 * mass, distance));
     const inc = Math.min(Math.PI - POLAR_EPS, Math.max(POLAR_EPS, inclinationDeg * DEG));
     const az = azimuthDeg * DEG;
     const s = Math.sin(inc);
-    this.camera.position.set(d * s * Math.sin(az), d * Math.cos(inc), d * s * Math.cos(az));
+    const camera = this.camera;
+    camera.position.set(d * s * Math.sin(az), d * Math.cos(inc), d * s * Math.cos(az));
     this.controls.target.set(0, 0, 0);
-    this.camera.lookAt(this.controls.target);
-    this.camera.updateMatrixWorld();
+    camera.up.copy(WORLD_UP);
+    camera.lookAt(ORIGIN);
+    if (roll !== 0) {
+      camera.rotateZ(roll);
+      camera.up.copy(WORLD_UP).applyQuaternion(camera.quaternion); // TrackballControls keeps this roll
+    }
+    camera.updateMatrixWorld();
   }
 
-  // Discard pending drag inertia: with damping off, update() applies the remaining delta and clears it.
+  /** Signed roll (rad, in (-π, π]) of the camera about its view axis relative to upright at its position. */
+  _roll() {
+    _q.setFromRotationMatrix(_m.lookAt(this.camera.position, ORIGIN, WORLD_UP)).invert().multiply(this.camera.quaternion);
+    const sign = _q.w < 0 ? -1 : 1; // same rotation, w >= 0 keeps the angle in (-π, π]
+    return 2 * Math.atan2(sign * _q.z, sign * _q.w);
+  }
+
+  // Apply any drag/zoom delta TrackballControls has not consumed yet, so nothing stale lands after a placement
+  // or cinematic. In static mode one update() consumes it all and leaves no inertia.
   _flushControls() {
-    const controls = this.controls;
-    const damping = controls.enableDamping;
-    controls.enableDamping = false;
-    controls.update();
-    controls.enableDamping = damping;
+    this.controls.update();
     this.camera.updateMatrixWorld();
   }
 }
