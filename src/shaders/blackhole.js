@@ -122,6 +122,11 @@ float diskTexture(float r, float angle, float age, float seed, float rayFootprin
   float lanes = smoothstep(0.25, 0.50, filteredFbm(turbulentFlow * 0.6 + 9.1, footprint));
   return 0.10 + 1.8 * filaments * lanes;
 }
+// Opacity of the disk where a ray crosses it at radius r (shared by disk shading and star halos).
+float diskOpacity(float r) {
+  float edge = smoothstep(innerRadius, innerRadius + 0.45, r) * (1.0 - smoothstep(16.0, 20.0, r));
+  return mix(0.999, 0.98, smoothstep(innerRadius + 2.0, 20.0, r)) * edge;
+}
 vec4 diskEmission(vec3 hit, vec3 rayDirection, float rayFootprint) {
   float r = length(hit.xz), angle = atan(hit.z, hit.x);
   // Finite-lived eddies advect at Omega, then renew invisibly as their crossfade reaches zero.
@@ -143,8 +148,7 @@ vec4 diskEmission(vec3 hit, vec3 rayDirection, float rayFootprint) {
     g = sqrt(max(0.0, 1.0 - 2.0 / r)) * sqrt(1.0 - beta * beta) / (1.0 - beta * cosTheta);
   }
   float temperature = diskTemp * pow(innerRadius / r, 0.75) * g;
-  float opacity = mix(0.999, 0.98, smoothstep(innerRadius + 2.0, 20.0, r)) * edge;
-  return vec4(blackbody(temperature) * (3.2 * heat * edge * density * pow(g, 4.0)), opacity);
+  return vec4(blackbody(temperature) * (3.2 * heat * edge * density * pow(g, 4.0)), diskOpacity(r));
 }
 // ---------------------------------------------------------------------------------------------
 // Bodies: probe spacecraft (SDF), stars, planets. Local ship frame: +x nose, +y up, +z starboard,
@@ -465,9 +469,16 @@ void applyDisk(vec3 hit, vec3 direction, float footprint, inout vec3 color, inou
   // Dense foreground material occludes the photon ring and later disk images.
   transmission *= 1.0 - emission.a;
 }
+// Antiderivative of (A2 + s^2)^(-3/2): the exact line integral of a softened 1/d^3 halo along a straight segment.
 float glowAntiderivative(float s, float A2) {
   return s * inversesqrt(A2 + s * s) / A2;
 }
+// Star halo, in units of the star radius: softening core^2, outer bound, and the kernel's value at the
+// bound, subtracted so each halo falls to exactly zero where its culling sphere ends.
+const float HALO_CORE2 = 0.5;
+const float HALO_BOUND = 4.5;
+const float HALO_EDGE = 0.010581; // (HALO_BOUND^2 + HALO_CORE2)^(-3/2)
+const float HALO_GAIN = 0.1;
 vec3 acceleration(vec3 p, vec3 velocity, float h2) {
   float r2 = dot(p, p), r = sqrt(r2);
   vec3 gravity = -3.0 * h2 * p / (r2 * r2 * r);
@@ -490,7 +501,7 @@ void main() {
       if (j >= bodyCount) break;
       vec4 A = bodyA[j], C = bodyC[j], D = bodyD[j];
       float kind = D.x, R = A.w;
-      float bound = R * (kind < 0.5 ? 1.85 : (kind < 1.5 ? 5.6 :
+      float bound = R * (kind < 0.5 ? 1.85 : (kind < 1.5 ? HALO_BOUND :
         (D.w < 0.5 && fract(D.z * 0.618034) > 0.45 ? 2.4 : 1.1)));
       vec3 center = A.xyz / mass;
       float planeDistance = planeLength > 1e-5
@@ -512,7 +523,8 @@ void main() {
   // (anti-aliased edges, the probe's bounding volume around its hull) can blend over what lies behind.
   vec3 colorAtHit = vec3(0.0);
   float glowAtHit = 0.0;
-  float coronaEnergy = 0.0, coronaTemp = 5800.0, coronaG = 1.0, coronaTransmission = 1.0;
+  // Star halos add up (overlapping stars blend instead of the brighter one cutting the other off).
+  vec3 halo = vec3(0.0);
   bool escaped = false;
   bool bending = lensing && lensingStrength > 0.0;
   float invMass = 1.0 / mass;
@@ -569,7 +581,7 @@ void main() {
         vec4 A = bodyA[j], C = bodyC[j], D = bodyD[j];
         float R = A.w, kind = D.x;
         bool ringed = kind > 1.5 && D.w < 0.5 && fract(D.z * 0.618034) > 0.45;
-        float bound = R * (kind < 0.5 ? 1.85 : (kind < 1.5 ? 5.6 : (ringed ? 2.4 : 1.1))) + pad;
+        float bound = R * (kind < 0.5 ? 1.85 : (kind < 1.5 ? HALO_BOUND : (ringed ? 2.4 : 1.1))) + pad;
         vec3 center = A.xyz * invMass;
         float centerRadius = length(center);
         float radialReach = bound * C.w + curvaturePad;
@@ -589,14 +601,30 @@ void main() {
         if (tExit < 0.0 || tEnter >= 1.0) continue;
       vec4 B = bodyB[j];
       if (kind > 0.5 && kind < 1.5) {
-        float rho = sqrt(max(0.0, qq - qs * qs / ss)) / R;
-        float glow = (1.0 - smoothstep(1.0, 5.6, rho)) * exp(-rho * 0.45) * stepSize * 0.06;
-        if (glow > coronaEnergy) {
-          coronaEnergy = glow;
-          coronaTemp = D.y;
-          coronaG = B.w;
-          if (doppler) coronaG *= sqrt(max(0.0, 1.0 - dot(B.xyz, B.xyz))) / max(0.05, 1.0 + dot(B.xyz, segDir));
-          coronaTransmission = transmission;
+        // Integrate the halo over this segment's chord through the glow sphere, stopping at the star's
+        // surface. Exact per segment, so it is continuous across steps and neighbouring pixels. Glow
+        // beyond a disk crossing in this segment is dimmed by the disk, like the star itself.
+        float t0 = max(tEnter, 0.0), t1 = min(tExit, 1.0);
+        float surfaceDisc = qs * qs - ss * (qq - R * R);
+        if (surfaceDisc >= 0.0) t1 = min(t1, max(t0, (-qs - sqrt(surfaceDisc)) / ss));
+        if (t1 > t0) {
+          float lengthR = sqrt(ss) / R;
+          float closest = -qs / ss;
+          float A2 = max(0.0, qq - qs * qs / ss) / (R * R) + HALO_CORE2;
+          float split = t1, behindDisk = transmission;
+          if (diskPending && diskFraction < t1) {
+            split = max(t0, diskFraction);
+            behindDisk = transmission * (1.0 - diskOpacity(length(diskHit.xz)));
+          }
+          float s0 = (t0 - closest) * lengthR, sSplit = (split - closest) * lengthR, s1 = (t1 - closest) * lengthR;
+          float near = glowAntiderivative(sSplit, A2) - glowAntiderivative(s0, A2) - (sSplit - s0) * HALO_EDGE;
+          float far = glowAntiderivative(s1, A2) - glowAntiderivative(sSplit, A2) - (s1 - sSplit) * HALO_EDGE;
+          float integral = transmission * near + behindDisk * far;
+          if (integral > 0.0) {
+            float g = B.w;
+            if (doppler) g *= sqrt(max(0.0, 1.0 - dot(B.xyz, B.xyz))) / max(0.05, 1.0 + dot(B.xyz, segDir));
+            halo += integral * blackbody(D.y * g) * starLuminosity(D.y) * pow(g, 4.0);
+          }
         }
       }
       float tBody = tEnter;
@@ -651,9 +679,7 @@ void main() {
       vec3 n = normalize(hitQ + hitT * hitSeg);
       float mu = clamp(dot(n, -hitSeg * inversesqrt(hitSs)), 0.0, 1.0);
       float T0 = D.y;
-      float corona = 1.0 - smoothstep(1.0, 4.5, sqrt(rho2) / R);
-      result.rgb = cover * starSurface(n, mu, T0, g, D.z, fpM / R)
-                 + blackbody(T0 * g) * starLuminosity(T0) * pow(g, 4.0) * corona * 0.03;
+      result.rgb = cover * starSurface(n, mu, T0, g, D.z, fpM / R);
       result.a = cover;
     } else {
       bool ringed = D.w < 0.5 && fract(D.z * 0.618034) > 0.45;
@@ -667,9 +693,7 @@ void main() {
     vec3 front = colorAtHit + blackbody(diskTemp) * glowAtHit;
     color = front + hitTransmission * bodyResult.rgb + (1.0 - bodyResult.a) * (color - front);
   }
-  if (coronaEnergy > 0.0) {
-    color += coronaTransmission * blackbody(coronaTemp * coronaG) * starLuminosity(coronaTemp) * pow(coronaG, 4.0) * coronaEnergy;
-  }
+  color += HALO_GAIN * halo;
   gl_FragColor = vec4(color, 1.0);
 }
 `;
